@@ -110,6 +110,14 @@ an entry point and links to the complete examples above.
 4. In the ACS handler, pass the posted response fields and the matching pending
    value to `sp.finish_sso(...)`.
 
+The returned `SsoSession::verified_xml_signatures()` view preserves one evidence
+item per successfully verified embedded XML signature that covers the Response
+root or consumed Assertion. Each item reports the exact
+`SignatureMethod@Algorithm` URI and its verified coverage. This differs from
+`SsoSession::sig_alg()`, which remains the singular detached `SigAlg` from a
+verified HTTP-Redirect or HTTP-POST-SimpleSign signature. Reporting an embedded
+algorithm does not itself apply an application algorithm allowlist.
+
 See [`examples/sso.rs`](examples/sso.rs) for a complete signed SP -> IdP -> SP
 round trip and the [doctested crate-root SSO
 fragment](https://docs.rs/saml-rs/latest/saml_rs/#sp-initiated-sso) for the

@@ -15,7 +15,10 @@ use crate::constants::transform_algorithm;
 use crate::error::{ReferenceResolutionReason, SamlError, SignatureVerificationReason};
 use crate::util::normalize_cert_string;
 use crate::xml::dom::{self, Node, XmlLimits};
-use bergshamra::{verify, verify_all, DsigContext, KeysManager, VerifiedReference, VerifyResult};
+use bergshamra::core::ns as bergshamra_ns;
+use bergshamra::dsig::verify::verify_all_document_with_source;
+use bergshamra::xml::{uppsala, Document as BergshamraDocument, NodeId as BergshamraNodeId};
+use bergshamra::{verify, DsigContext, KeysManager, VerifiedReference, VerifyResult};
 use std::collections::HashSet;
 
 fn children_named<'a>(node: &'a Node, name: &str) -> Vec<&'a Node> {
@@ -291,6 +294,121 @@ fn assertion_is_directly_covered(root: &Node, targets: &[VerifiedTarget]) -> boo
     false
 }
 
+fn bergshamra_child_element(
+    document: &BergshamraDocument<'_>,
+    parent: BergshamraNodeId,
+    namespace: &str,
+    local_name: &str,
+) -> Option<BergshamraNodeId> {
+    document.children_iter(parent).find(|child| {
+        document
+            .element(*child)
+            .is_some_and(|element| element.matches_name_ns(namespace, local_name))
+    })
+}
+
+fn verified_signature_algorithm(
+    document: &BergshamraDocument<'_>,
+    signature_node: BergshamraNodeId,
+) -> Result<String, SamlError> {
+    let signed_info = bergshamra_child_element(
+        document,
+        signature_node,
+        bergshamra_ns::DSIG,
+        bergshamra_ns::node::SIGNED_INFO,
+    )
+    .ok_or_else(|| SamlError::Crypto("verified signature is missing SignedInfo".into()))?;
+    let signature_method = bergshamra_child_element(
+        document,
+        signed_info,
+        bergshamra_ns::DSIG,
+        bergshamra_ns::node::SIGNATURE_METHOD,
+    )
+    .ok_or_else(|| SamlError::Crypto("verified signature is missing SignatureMethod".into()))?;
+    document
+        .element(signature_method)
+        .and_then(|element| element.get_attribute(bergshamra_ns::attr::ALGORITHM))
+        .filter(|algorithm| !algorithm.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            SamlError::Crypto("verified signature is missing SignatureMethod Algorithm".into())
+        })
+}
+
+fn reference_covers_node(references: &[VerifiedReference], node: BergshamraNodeId) -> bool {
+    references
+        .iter()
+        .any(|reference| reference.resolved_node == Some(node))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedEmbeddedSignature {
+    algorithm_uri: String,
+    assertion_directly_covered: bool,
+    response_covered: bool,
+}
+
+impl VerifiedEmbeddedSignature {
+    pub(crate) fn algorithm_uri(&self) -> &str {
+        &self.algorithm_uri
+    }
+
+    pub(crate) fn assertion_directly_covered(&self) -> bool {
+        self.assertion_directly_covered
+    }
+
+    pub(crate) fn response_covered(&self) -> bool {
+        self.response_covered
+    }
+}
+
+fn verified_embedded_signature(
+    document: &BergshamraDocument<'_>,
+    signature_node: BergshamraNodeId,
+    references: &[VerifiedReference],
+    targets: &[VerifiedTarget],
+) -> Result<Option<VerifiedEmbeddedSignature>, SamlError> {
+    let Some(root) = document.document_element() else {
+        return Ok(None);
+    };
+    let root_element = document
+        .element(root)
+        .ok_or_else(|| SamlError::Crypto("verified document root is not an element".into()))?;
+    let whole_document_covered = targets
+        .iter()
+        .any(|target| matches!(target, VerifiedTarget::WholeDocument));
+
+    let response_covered = root_element
+        .matches_name_ns(crate::constants::namespace::PROTOCOL, "Response")
+        && (whole_document_covered || reference_covers_node(references, root));
+    let assertion_node =
+        if root_element.matches_name_ns(crate::constants::namespace::ASSERTION, "Assertion") {
+            Some(root)
+        } else if root_element.matches_name_ns(crate::constants::namespace::PROTOCOL, "Response") {
+            bergshamra_child_element(
+                document,
+                root,
+                crate::constants::namespace::ASSERTION,
+                "Assertion",
+            )
+        } else {
+            None
+        };
+    let assertion_directly_covered = assertion_node.is_some_and(|assertion| {
+        reference_covers_node(references, assertion)
+            || (assertion == root && whole_document_covered)
+    });
+
+    if !response_covered && !assertion_directly_covered {
+        return Ok(None);
+    }
+    Ok(Some(VerifiedEmbeddedSignature {
+        algorithm_uri: verified_signature_algorithm(document, signature_node)?,
+        assertion_directly_covered,
+        response_covered,
+    }))
+}
+
 /// True for a signed `<Reference>` URI that is not same-document (i.e. not a
 /// `#id` fragment or the whole document). Such references can pull external or
 /// local-file content into the verified set and are rejected for SAML.
@@ -473,6 +591,7 @@ pub(crate) struct SignatureVerification {
     signed_content: Option<String>,
     assertion_directly_covered: bool,
     response_covered: bool,
+    verified_embedded_signatures: Vec<VerifiedEmbeddedSignature>,
 }
 
 impl SignatureVerification {
@@ -486,6 +605,10 @@ impl SignatureVerification {
 
     pub(crate) fn response_covered(&self) -> bool {
         self.response_covered
+    }
+
+    pub(crate) fn verified_embedded_signatures(&self) -> &[VerifiedEmbeddedSignature] {
+        &self.verified_embedded_signatures
     }
 
     pub(crate) fn into_signed_content(self) -> Option<String> {
@@ -517,6 +640,7 @@ pub(crate) fn verify_signatures_detailed_with_limits(
             signed_content: None,
             assertion_directly_covered: false,
             response_covered: false,
+            verified_embedded_signatures: Vec::new(),
         });
     }
     preflight_saml_reference_uris(&signature_candidates)?;
@@ -540,6 +664,11 @@ pub(crate) fn verify_signatures_detailed_with_limits(
     let mut last_err: Option<SamlError> = None;
     let mut first_signature_verified = false;
     let mut targets = Vec::new();
+    // Reuse this exact verifier DOM for every pinned certificate attempt and
+    // for evidence extraction from each successful signature node.
+    let document = uppsala::parse(xml).map_err(|error| SamlError::Crypto(error.to_string()))?;
+    let mut verified_signature_nodes = HashSet::new();
+    let mut verified_embedded_signatures = Vec::new();
     for cert in metadata_certs {
         let key = match load_certificate(cert) {
             Ok(key) => key,
@@ -557,17 +686,31 @@ pub(crate) fn verify_signatures_detailed_with_limits(
             .with_require_reference_digests(true)
             .with_hmac_min_out_len(160)
             .with_insecure(true);
-        match verify_all(&ctx, xml) {
+        match verify_all_document_with_source(&ctx, &document, Some(xml)) {
             Ok(results) => {
                 first_signature_verified |=
                     matches!(results.first(), Some(VerifyResult::Valid { .. }));
                 for result in results {
                     match result {
                         VerifyResult::Valid {
-                            signature_node: _,
+                            signature_node,
                             references,
                             ..
-                        } => targets.extend(verified_targets(&references)?),
+                        } => {
+                            let signature_targets = verified_targets(&references)?;
+                            if verified_signature_nodes.insert(signature_node) {
+                                if let Some(signature) = verified_embedded_signature(
+                                    &document,
+                                    signature_node,
+                                    &references,
+                                    &signature_targets,
+                                )? {
+                                    verified_embedded_signatures
+                                        .push((signature_node.index(), signature));
+                                }
+                            }
+                            targets.extend(signature_targets);
+                        }
                         VerifyResult::Invalid { .. } => tried_invalid = true,
                     }
                 }
@@ -579,6 +722,7 @@ pub(crate) fn verify_signatures_detailed_with_limits(
         return Err(key_load_error.unwrap_or(SamlError::NoTrustedCertificate));
     }
     if first_signature_verified && !targets.is_empty() {
+        verified_embedded_signatures.sort_by_key(|(index, _)| *index);
         let assertion_directly_covered = assertion_is_directly_covered(root, &targets);
         let response_covered =
             root.local_name.contains("Response") && response_is_covered(&targets, root);
@@ -587,6 +731,10 @@ pub(crate) fn verify_signatures_detailed_with_limits(
             signed_content: verified_content(root, xml, &targets)?,
             assertion_directly_covered,
             response_covered,
+            verified_embedded_signatures: verified_embedded_signatures
+                .into_iter()
+                .map(|(_, signature)| signature)
+                .collect(),
         });
     }
     match last_err {
@@ -596,6 +744,7 @@ pub(crate) fn verify_signatures_detailed_with_limits(
             signed_content: None,
             assertion_directly_covered: false,
             response_covered: false,
+            verified_embedded_signatures: Vec::new(),
         }),
     }
 }
@@ -712,7 +861,7 @@ pub fn verify_metadata_signature_detailed_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::signature_algorithm::RSA_SHA256;
+    use crate::constants::signature_algorithm::{RSA_SHA256, RSA_SHA512};
     use crate::constants::{digest_for_signature, namespace, transform_algorithm};
     use crate::crypto::construct_saml_signature;
     use crate::crypto::keys::load_private_key;
@@ -837,6 +986,8 @@ mod tests {
     // SP signing cert (matches signed_request_sha256.xml signer).
     const SP_CERT: &str = include_str!("../../tests/fixtures/key/sp_cert.cer");
     const SP_SIGNING_CERT: &str = include_str!("../../tests/fixtures/key/sp_signing_cert.cer");
+    const UNTRUSTED_PRIVKEY: &str = include_str!("../../tests/fixtures/key/idp/privkey2.pem");
+    const UNTRUSTED_CERT: &str = include_str!("../../tests/fixtures/key/idp/cert2.cer");
 
     fn signed_response_with_foreign_extension_certificate(
     ) -> Result<String, Box<dyn std::error::Error>> {
@@ -869,6 +1020,121 @@ mod tests {
         Ok(RESPONSE_SIGNED.replacen(
             "<samlp:Status>",
             &format!("{invalid_signature}<samlp:Status>"),
+            1,
+        ))
+    }
+
+    fn signature_over_top_level_issuer(
+        key_pem: &str,
+        certificate: &str,
+        algorithm: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let issuer_id = "_signed_response_issuer";
+        let response = RESPONSE.replacen(
+            "<saml:Issuer>",
+            &format!("<saml:Issuer ID=\"{issuer_id}\">"),
+            1,
+        );
+        let digest = digest_for_signature(algorithm).ok_or("unknown digest")?;
+        let signature = format!(
+            "<ds:Signature xmlns:ds=\"{dsig}\"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm=\"{exc_c14n}\"/><ds:SignatureMethod Algorithm=\"{algorithm}\"/><ds:Reference URI=\"#{issuer_id}\"><ds:Transforms><ds:Transform Algorithm=\"{enveloped}\"/><ds:Transform Algorithm=\"{exc_c14n}\"/></ds:Transforms><ds:DigestMethod Algorithm=\"{digest}\"/><ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue></ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>",
+            dsig = namespace::DSIG,
+            exc_c14n = transform_algorithm::EXC_C14N,
+            enveloped = transform_algorithm::ENVELOPED_SIGNATURE,
+            cert = normalize_cert_string(certificate),
+        );
+        let template = response.replacen(
+            "</saml:Issuer><samlp:Status>",
+            &format!("</saml:Issuer>{signature}<samlp:Status>"),
+            1,
+        );
+        let key = load_private_key(key_pem, None)?;
+        let mut manager = KeysManager::new();
+        manager.add_key(key);
+        let context = DsigContext::new(manager).with_insecure(true);
+        Ok(sign(&context, &template)?)
+    }
+
+    fn signature_over_response_and_assertion() -> Result<String, Box<dyn std::error::Error>> {
+        let document = dom::parse(RESPONSE)?;
+        let response_id = node_saml_id(&document.root).ok_or("missing Response ID")?;
+        let assertion = children_named(&document.root, "Assertion")
+            .into_iter()
+            .next()
+            .ok_or("missing Assertion")?;
+        let assertion_id = node_saml_id(assertion).ok_or("missing Assertion ID")?;
+        let digest = digest_for_signature(RSA_SHA512).ok_or("unknown digest")?;
+        let reference = |id: &str| {
+            format!(
+                "<ds:Reference URI=\"#{id}\"><ds:Transforms><ds:Transform Algorithm=\"{enveloped}\"/><ds:Transform Algorithm=\"{exc_c14n}\"/></ds:Transforms><ds:DigestMethod Algorithm=\"{digest}\"/><ds:DigestValue></ds:DigestValue></ds:Reference>",
+                enveloped = transform_algorithm::ENVELOPED_SIGNATURE,
+                exc_c14n = transform_algorithm::EXC_C14N,
+            )
+        };
+        let signature = format!(
+            "<ds:Signature xmlns:ds=\"{dsig}\"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm=\"{exc_c14n}\"/><ds:SignatureMethod Algorithm=\"{algorithm}\"/>{response_reference}{assertion_reference}</ds:SignedInfo><ds:SignatureValue></ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>",
+            dsig = namespace::DSIG,
+            exc_c14n = transform_algorithm::EXC_C14N,
+            algorithm = RSA_SHA512,
+            response_reference = reference(response_id),
+            assertion_reference = reference(assertion_id),
+            cert = normalize_cert_string(SP_SIGNING_CERT),
+        );
+        let template = RESPONSE.replacen(
+            "</saml:Issuer><samlp:Status>",
+            &format!("</saml:Issuer>{signature}<samlp:Status>"),
+            1,
+        );
+        let key = load_private_key(SP_PRIVKEY, None)?;
+        let mut manager = KeysManager::new();
+        manager.add_key(key);
+        let context = DsigContext::new(manager).with_insecure(true);
+        Ok(sign(&context, &template)?)
+    }
+
+    fn root_signature(xml: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let document = dom::parse(xml)?;
+        let signature = children_named(&document.root, "Signature")
+            .into_iter()
+            .next()
+            .ok_or("missing root Signature")?;
+        Ok(xml[signature.start..signature.end].to_string())
+    }
+
+    fn remove_signature_key_info(signature: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let document = dom::parse(signature)?;
+        let key_info = children_named(&document.root, "KeyInfo")
+            .into_iter()
+            .next()
+            .ok_or("missing KeyInfo")?;
+        Ok(format!(
+            "{}{}",
+            &signature[..key_info.start],
+            &signature[key_info.end..]
+        ))
+    }
+
+    fn assertion_signed_response_with_extra_signature(
+        extra_signature: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let response = RESPONSE.replacen(
+            "<saml:Issuer>",
+            "<saml:Issuer ID=\"_signed_response_issuer\">",
+            1,
+        );
+        let key = load_private_key(SP_PRIVKEY, None)?;
+        let assertion_signed = construct_saml_signature(
+            &response,
+            false,
+            &key,
+            SP_SIGNING_CERT,
+            RSA_SHA256,
+            &[],
+            None,
+        )?;
+        Ok(assertion_signed.replacen(
+            "</samlp:Response>",
+            &format!("{extra_signature}</samlp:Response>"),
             1,
         ))
     }
@@ -1005,6 +1271,76 @@ mod tests {
             XmlLimits::default(),
         )?;
         assert!(!result.verified() && !result.response_covered());
+        assert!(result.verified_embedded_signatures().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn detailed_verification_excludes_untrusted_extra_signature_evidence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let untrusted = root_signature(&signature_over_top_level_issuer(
+            UNTRUSTED_PRIVKEY,
+            UNTRUSTED_CERT,
+            RSA_SHA512,
+        )?)?;
+        let untrusted = remove_signature_key_info(&untrusted)?;
+        let signed = assertion_signed_response_with_extra_signature(&untrusted)?;
+        let result = verify_signatures_detailed_with_limits(
+            &signed,
+            &[SP_SIGNING_CERT.to_string()],
+            XmlLimits::default(),
+        )?;
+
+        let [signature] = result.verified_embedded_signatures() else {
+            return Err("expected only the trusted Assertion signature".into());
+        };
+        assert!(result.verified() && result.assertion_directly_covered());
+        assert_eq!(signature.algorithm_uri(), RSA_SHA256);
+        assert!(signature.assertion_directly_covered() && !signature.response_covered());
+        Ok(())
+    }
+
+    #[test]
+    fn detailed_verification_excludes_valid_unrelated_signature_evidence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let unrelated = root_signature(&signature_over_top_level_issuer(
+            SP_PRIVKEY,
+            SP_SIGNING_CERT,
+            RSA_SHA512,
+        )?)?;
+        let signed = assertion_signed_response_with_extra_signature(&unrelated)?;
+        let result = verify_signatures_detailed_with_limits(
+            &signed,
+            &[SP_SIGNING_CERT.to_string()],
+            XmlLimits::default(),
+        )?;
+
+        let [signature] = result.verified_embedded_signatures() else {
+            return Err("expected only the Assertion-covering signature".into());
+        };
+        assert!(result.verified() && result.assertion_directly_covered());
+        assert_eq!(signature.algorithm_uri(), RSA_SHA256);
+        assert!(signature.assertion_directly_covered() && !signature.response_covered());
+        Ok(())
+    }
+
+    #[test]
+    fn detailed_verification_reports_one_signature_covering_response_and_assertion(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let signed = signature_over_response_and_assertion()?;
+        let result = verify_signatures_detailed_with_limits(
+            &signed,
+            &[SP_SIGNING_CERT.to_string()],
+            XmlLimits::default(),
+        )?;
+
+        let [signature] = result.verified_embedded_signatures() else {
+            return Err("expected one verified embedded signature".into());
+        };
+        assert!(result.verified() && result.assertion_directly_covered());
+        assert!(result.response_covered());
+        assert_eq!(signature.algorithm_uri(), RSA_SHA512);
+        assert!(signature.assertion_directly_covered() && signature.response_covered());
         Ok(())
     }
 
@@ -1029,6 +1365,7 @@ mod tests {
         assert!(
             result.verified() && result.assertion_directly_covered() && result.response_covered()
         );
+        assert_eq!(result.verified_embedded_signatures().len(), 2);
         Ok(())
     }
 
