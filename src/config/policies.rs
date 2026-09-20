@@ -44,6 +44,18 @@ pub enum ResponseSignaturePolicy {
     RequireSigned,
 }
 
+/// Inbound embedded XML-signature algorithm and reference profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XmlSignatureProfile {
+    /// Require one local-ID reference plus RSA-SHA2, SHA2 digests, enveloped
+    /// signature, and exclusive canonicalization only.
+    #[default]
+    StrictRsaSha2,
+    /// Accept every algorithm and same-document reference shape supported by
+    /// the selected cryptographic provider.
+    AllowProviderSupportedForCompatibility,
+}
+
 /// Whether an SP signs outgoing AuthnRequests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AuthnRequestSigningPolicy {
@@ -101,6 +113,8 @@ pub struct SpValidationPolicy {
     pub assertions: AssertionSignaturePolicy,
     /// Top-level SAML Response signature requirement.
     pub responses: ResponseSignaturePolicy,
+    /// Embedded XML-signature algorithm and reference requirements.
+    pub xml_signatures: XmlSignatureProfile,
     /// Outbound AuthnRequest signing behavior.
     pub authn_requests: AuthnRequestSigningPolicy,
     /// Audience validation behavior.
@@ -117,6 +131,7 @@ impl SpValidationPolicy {
         Self {
             assertions: AssertionSignaturePolicy::RequireSigned,
             responses: ResponseSignaturePolicy::RequireForEncryptedCbc,
+            xml_signatures: XmlSignatureProfile::StrictRsaSha2,
             authn_requests: AuthnRequestSigningPolicy::Sign,
             audience: AudienceValidationPolicy::Validate,
             name_id_creation: NameIdCreationPolicy::DoNotAllowCreate,
@@ -129,6 +144,7 @@ impl SpValidationPolicy {
         Self {
             assertions: AssertionSignaturePolicy::AllowUnsignedForCompatibility,
             responses: ResponseSignaturePolicy::AllowUnsignedEncryptedCbcForCompatibility,
+            xml_signatures: XmlSignatureProfile::AllowProviderSupportedForCompatibility,
             authn_requests: AuthnRequestSigningPolicy::DoNotSignForCompatibility,
             audience: AudienceValidationPolicy::SkipForCompatibility,
             name_id_creation: NameIdCreationPolicy::DoNotAllowCreate,

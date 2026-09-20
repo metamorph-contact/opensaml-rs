@@ -28,6 +28,15 @@ fn children_named<'a>(node: &'a Node, name: &str) -> Vec<&'a Node> {
         .collect()
 }
 
+fn exactly_one_child_named<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
+    let mut matching = node
+        .children
+        .iter()
+        .filter(|child| child.local_name == name);
+    let only = matching.next()?;
+    matching.next().is_none().then_some(only)
+}
+
 fn has_child(node: &Node, name: &str) -> bool {
     node.children.iter().any(|c| c.local_name == name)
 }
@@ -49,6 +58,9 @@ fn has_descendant(node: &Node, names: &[&str]) -> bool {
 /// XSW guard: `Response/Assertion/Subject/SubjectConfirmation/SubjectConfirmationData//(Assertion|Signature)`.
 fn wrapping_detected(root: &Node) -> bool {
     for assertion in children_named(root, "Assertion") {
+        if has_descendant(assertion, &["Assertion"]) {
+            return true;
+        }
         for subject in children_named(assertion, "Subject") {
             for sc in children_named(subject, "SubjectConfirmation") {
                 for scd in children_named(sc, "SubjectConfirmationData") {
@@ -429,6 +441,75 @@ fn preflight_saml_reference_uris(signatures: &[&Node]) -> Result<(), SamlError> 
         }
     }
     Ok(())
+}
+
+fn preflight_strict_saml_signature_profile(signatures: &[&Node]) -> Result<(), SamlError> {
+    for signature in signatures {
+        let signed_info = exactly_one_child_named(signature, "SignedInfo")
+            .ok_or(SamlError::SignedReferenceMismatch)?;
+        let canonicalization = exactly_one_child_named(signed_info, "CanonicalizationMethod")
+            .ok_or(SamlError::AlgorithmUnsupported)?;
+        if canonicalization.attr("Algorithm") != Some(transform_algorithm::EXC_C14N) {
+            return Err(SamlError::AlgorithmUnsupported);
+        }
+        let signature_method = exactly_one_child_named(signed_info, "SignatureMethod")
+            .ok_or(SamlError::AlgorithmUnsupported)?;
+        if !matches!(
+            signature_method.attr("Algorithm"),
+            Some(
+                crate::constants::signature_algorithm::RSA_SHA256
+                    | crate::constants::signature_algorithm::RSA_SHA384
+                    | crate::constants::signature_algorithm::RSA_SHA512
+            )
+        ) {
+            return Err(SamlError::AlgorithmUnsupported);
+        }
+        let reference = exactly_one_child_named(signed_info, "Reference")
+            .ok_or(SamlError::SignedReferenceMismatch)?;
+        let Some(uri) = reference.attr("URI") else {
+            return Err(reference_resolution(
+                ReferenceResolutionReason::UnsupportedReferenceUri,
+            ));
+        };
+        if !uri.starts_with('#') || uri.len() == 1 || uri.starts_with("#xpointer(") {
+            return Err(reference_resolution(
+                ReferenceResolutionReason::UnsupportedReferenceUri,
+            ));
+        }
+        verified_target_from_uri(uri)?;
+
+        let digest_method = exactly_one_child_named(reference, "DigestMethod")
+            .ok_or(SamlError::AlgorithmUnsupported)?;
+        if !matches!(
+            digest_method.attr("Algorithm"),
+            Some(
+                crate::constants::digest_algorithm::SHA256
+                    | crate::constants::digest_algorithm::SHA384
+                    | crate::constants::digest_algorithm::SHA512
+            )
+        ) {
+            return Err(SamlError::AlgorithmUnsupported);
+        }
+        for transforms in children_named(reference, "Transforms") {
+            for transform in children_named(transforms, "Transform") {
+                if !matches!(
+                    transform.attr("Algorithm"),
+                    Some(transform_algorithm::ENVELOPED_SIGNATURE | transform_algorithm::EXC_C14N)
+                ) {
+                    return Err(SamlError::AlgorithmUnsupported);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_strict_saml_signature_profile_with_limits(
+    xml: &str,
+    limits: XmlLimits,
+) -> Result<(), SamlError> {
+    let document = dom::parse_with_limits(xml, limits)?;
+    preflight_strict_saml_signature_profile(&saml_signature_candidates(&document.root))
 }
 
 pub(crate) fn has_xml_signature_with_limits(
@@ -861,7 +942,7 @@ pub fn verify_metadata_signature_detailed_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::signature_algorithm::{RSA_SHA256, RSA_SHA512};
+    use crate::constants::signature_algorithm::{RSA_SHA256, RSA_SHA384, RSA_SHA512};
     use crate::constants::{digest_for_signature, namespace, transform_algorithm};
     use crate::crypto::construct_saml_signature;
     use crate::crypto::keys::load_private_key;
@@ -940,6 +1021,110 @@ mod tests {
                 reason: ReferenceResolutionReason::UnsupportedReferenceUri
             })
         ));
+    }
+
+    fn preflight_signature(
+        canonicalization: &str,
+        signature: &str,
+        digest: &str,
+        transform: &str,
+        references: usize,
+        uri: &str,
+    ) -> Result<(), SamlError> {
+        let reference = format!(
+            "<ds:Reference URI=\"{uri}\"><ds:Transforms><ds:Transform Algorithm=\"{enveloped}\"/><ds:Transform Algorithm=\"{transform}\"/></ds:Transforms><ds:DigestMethod Algorithm=\"{digest}\"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>",
+            enveloped = transform_algorithm::ENVELOPED_SIGNATURE,
+        );
+        let xml = format!(
+            "<samlp:Response xmlns:samlp=\"{protocol}\" xmlns:ds=\"{dsig}\" ID=\"_response\"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm=\"{canonicalization}\"/><ds:SignatureMethod Algorithm=\"{signature}\"/>{references}</ds:SignedInfo><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature></samlp:Response>",
+            protocol = namespace::PROTOCOL,
+            dsig = namespace::DSIG,
+            references = reference.repeat(references),
+        );
+        let document = dom::parse(&xml)?;
+        preflight_strict_saml_signature_profile(&saml_signature_candidates(&document.root))
+    }
+
+    #[test]
+    fn strict_saml_signature_preflight_accepts_only_the_initial_profile() {
+        for (signature, digest) in [
+            (RSA_SHA256, crate::constants::digest_algorithm::SHA256),
+            (RSA_SHA384, crate::constants::digest_algorithm::SHA384),
+            (RSA_SHA512, crate::constants::digest_algorithm::SHA512),
+        ] {
+            assert!(preflight_signature(
+                transform_algorithm::EXC_C14N,
+                signature,
+                digest,
+                transform_algorithm::EXC_C14N,
+                1,
+                "#_response",
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn strict_saml_signature_preflight_rejects_ambiguous_references_and_algorithms() {
+        let accepted = (
+            transform_algorithm::EXC_C14N,
+            RSA_SHA256,
+            crate::constants::digest_algorithm::SHA256,
+            transform_algorithm::EXC_C14N,
+        );
+        for (references, uri) in [(0, "#_response"), (2, "#_response"), (1, "")] {
+            assert!(preflight_signature(
+                accepted.0, accepted.1, accepted.2, accepted.3, references, uri,
+            )
+            .is_err());
+        }
+        for rejected in [
+            preflight_signature(
+                "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+                accepted.1,
+                accepted.2,
+                accepted.3,
+                1,
+                "#_response",
+            ),
+            preflight_signature(
+                accepted.0,
+                "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+                accepted.2,
+                accepted.3,
+                1,
+                "#_response",
+            ),
+            preflight_signature(
+                accepted.0,
+                accepted.1,
+                "http://www.w3.org/2000/09/xmldsig#sha1",
+                accepted.3,
+                1,
+                "#_response",
+            ),
+            preflight_signature(
+                accepted.0,
+                accepted.1,
+                accepted.2,
+                "http://www.w3.org/TR/1999/REC-xslt-19991116",
+                1,
+                "#_response",
+            ),
+        ] {
+            assert!(matches!(rejected, Err(SamlError::AlgorithmUnsupported)));
+        }
+    }
+
+    #[test]
+    fn nested_assertion_is_a_wrapping_shape() -> Result<(), Box<dyn std::error::Error>> {
+        let document = dom::parse(&format!(
+            "<samlp:Response xmlns:samlp=\"{protocol}\" xmlns:saml=\"{assertion}\"><saml:Assertion ID=\"_outer\"><saml:Assertion ID=\"_nested\"/></saml:Assertion></samlp:Response>",
+            protocol = namespace::PROTOCOL,
+            assertion = namespace::ASSERTION,
+        ))?;
+        assert!(wrapping_detected(&document.root));
+        Ok(())
     }
 
     #[test]

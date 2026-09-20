@@ -108,6 +108,8 @@ pub struct FlowOptions<'a> {
     pub xml_limits: XmlLimits,
     /// Whether to require and verify a signature.
     pub check_signature: bool,
+    /// Whether embedded SAML signatures must satisfy the strict RSA-SHA2 profile.
+    pub strict_xml_signature_profile: bool,
     /// Expected issuer (peer `entityID`).
     pub from_issuer: Option<&'a str>,
     /// Peer signing certificate(s) for verification.
@@ -142,6 +144,7 @@ impl<'a> Default for FlowOptions<'a> {
             redirect_inflate_max_bytes: MAX_DEFLATE_RAW_DECODE_BYTES,
             xml_limits: XmlLimits::default(),
             check_signature: false,
+            strict_xml_signature_profile: false,
             from_issuer: None,
             signing_certs: &[],
             decrypt_key: None,
@@ -492,6 +495,12 @@ fn verify_embedded_signature(
     xml: &str,
     opts: &FlowOptions<'_>,
 ) -> Result<EmbeddedSignatureEvidence, SamlError> {
+    if opts.strict_xml_signature_profile {
+        crate::crypto::verify::validate_strict_saml_signature_profile_with_limits(
+            xml,
+            opts.xml_limits,
+        )?;
+    }
     let verification = crate::crypto::verify::verify_signatures_detailed_with_limits(
         xml,
         opts.signing_certs,
