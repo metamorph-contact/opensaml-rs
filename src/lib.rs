@@ -357,7 +357,7 @@ pub use config::{
     LogoutSignaturePolicy, MetadataTrustPolicy, NameIdCreationPolicy, NameIdFormat, Passphrase,
     PrivateKeyPem, ResponseSignaturePolicy, SignatureAlgorithm, SpConfig, SpConfigBuilder,
     SpDescriptor, SpMetadataConfig, SpValidationPolicy, TemplatePolicy, TransformAlgorithm,
-    XmlEncryptionPolicy, XmlPolicy,
+    XmlEncryptionPolicy, XmlPolicy, XmlSignatureProfile,
 };
 #[cfg(any(
     feature = "crypto-rustcrypto",
