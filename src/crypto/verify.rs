@@ -1171,8 +1171,9 @@ mod tests {
     // SP signing cert (matches signed_request_sha256.xml signer).
     const SP_CERT: &str = include_str!("../../tests/fixtures/key/sp_cert.cer");
     const SP_SIGNING_CERT: &str = include_str!("../../tests/fixtures/key/sp_signing_cert.cer");
-    const UNTRUSTED_PRIVKEY: &str = include_str!("../../tests/fixtures/key/idp/privkey2.pem");
-    const UNTRUSTED_CERT: &str = include_str!("../../tests/fixtures/key/idp/cert2.cer");
+    const UNTRUSTED_PRIVKEY: &str =
+        include_str!("../../tests/fixtures/key/idp/provider_matrix_privkey.pkcs8.pem");
+    const UNTRUSTED_CERT: &str = include_str!("../../tests/fixtures/key/idp/cert.cer");
 
     fn signed_response_with_foreign_extension_certificate(
     ) -> Result<String, Box<dyn std::error::Error>> {
