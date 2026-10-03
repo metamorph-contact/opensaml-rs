@@ -58,12 +58,12 @@ crypto-pkcs11 = ["bergshamra?/pkcs11"]
 [dependencies]
 base64 = "0.23"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-quick-xml = "0.41"
+quick-xml = "0.42"
 thiserror = "2"
 time = { version = "0.3", default-features = false, features = ["std", "parsing"] }
 url = "2"
 uuid = { version = "1", default-features = false, features = ["v4"] }
-bergshamra = { version = "0.8.0", optional = true, default-features = false }
+bergshamra = { version = "0.9.0", optional = true, default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"

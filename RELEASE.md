@@ -37,8 +37,8 @@ Recommended setup is crates.io trusted publishing:
    environment `release`.
 4. Do not configure `CARGO_REGISTRY_TOKEN` when using trusted publishing.
 
-Before publishing, configure trusted publishing for the final GitHub repository
-name if the repository rename has not happened yet.
+The GitHub repository is `salasebas/saml-rs`. The published crate name is
+`saml-rs`.
 
 ## Manual fallback
 
