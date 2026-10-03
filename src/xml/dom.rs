@@ -341,7 +341,7 @@ fn parse_roots_inner(
             Event::DocType(_) => {
                 return Err(SamlError::Xml("DOCTYPE is not allowed".into()));
             }
-            Event::PI(instruction) if instruction.target() == b"xml-stylesheet" => {
+            Event::PI(instruction) if instruction.target() == "xml-stylesheet" => {
                 return Err(SamlError::Xml(
                     "xml-stylesheet processing instructions are not allowed".into(),
                 ));
