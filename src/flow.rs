@@ -495,16 +495,11 @@ fn verify_embedded_signature(
     xml: &str,
     opts: &FlowOptions<'_>,
 ) -> Result<EmbeddedSignatureEvidence, SamlError> {
-    if opts.strict_xml_signature_profile {
-        crate::crypto::verify::validate_strict_saml_signature_profile_with_limits(
-            xml,
-            opts.xml_limits,
-        )?;
-    }
-    let verification = crate::crypto::verify::verify_signatures_detailed_with_limits(
+    let verification = crate::crypto::verify::verify_signatures_detailed_with_profile(
         xml,
         opts.signing_certs,
         opts.xml_limits,
+        opts.strict_xml_signature_profile,
     )?;
     let verified_xml_signatures = verification
         .verified_embedded_signatures()
