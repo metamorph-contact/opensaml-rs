@@ -53,6 +53,12 @@ mod tests {
     use super::*;
 
     const SP_PRIVKEY: &str = include_str!("../../tests/fixtures/key/sp_privkey.pem");
+    // RustCrypto decrypts this PEM. AWS-LC and FIPS reject it.
+    #[cfg(any(
+        feature = "crypto-rustcrypto",
+        feature = "crypto-aws-lc",
+        feature = "crypto-fips"
+    ))]
     const SP_PRIVKEY_ENC: &str = include_str!("../../tests/fixtures/key/sp_privkey_enc.pem");
     const SP_CERT: &str = include_str!("../../tests/fixtures/key/sp_cert.cer");
     const IDP_CERT: &str = include_str!("../../tests/fixtures/key/idp_cert.cer");
@@ -77,7 +83,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "crypto-aws-lc", not(feature = "crypto-rustcrypto")))]
+    #[cfg(all(
+        any(feature = "crypto-aws-lc", feature = "crypto-fips"),
+        not(feature = "crypto-rustcrypto")
+    ))]
     fn rejects_encrypted_private_key_when_provider_does_not_support_it() {
         assert!(load_private_key(SP_PRIVKEY_ENC, Some("unused")).is_err());
     }
